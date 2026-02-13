@@ -4,13 +4,36 @@ import path from "path";
 import { NextResponse } from "next/server";
 import { checkRateLimit, incrementCount, getRemainingInfo } from "./rate-limiter";
 
-// Define the path to the instructional materials
-const INSTRUCTION_FILE_PATH = path.join(process.cwd(), "data", "materials.md");
+// データフォルダのパス
+const DATA_DIR = path.join(process.cwd(), "data");
 
 // GET: 残り回数を返す
 export async function GET() {
     const info = getRemainingInfo();
     return NextResponse.json(info);
+}
+
+// data/ フォルダ内の全 .md ファイル名を取得
+function getAvailableTopics(): { filename: string; name: string }[] {
+    try {
+        const files = fs.readdirSync(DATA_DIR).filter((f) => f.endsWith(".md"));
+        return files.map((f) => ({
+            filename: f,
+            name: f.replace(".md", ""),
+        }));
+    } catch {
+        return [];
+    }
+}
+
+// 指定ファイルの内容を読み込み
+function readTopicFile(filename: string): string {
+    try {
+        const filePath = path.join(DATA_DIR, filename);
+        return fs.readFileSync(filePath, "utf-8");
+    } catch {
+        return "";
+    }
 }
 
 export async function POST(req: Request) {
@@ -41,26 +64,71 @@ export async function POST(req: Request) {
             );
         }
 
-        // Read the content of the instructional material
-        let context = "";
-        try {
-            if (fs.existsSync(INSTRUCTION_FILE_PATH)) {
-                context = fs.readFileSync(INSTRUCTION_FILE_PATH, "utf-8");
-            } else {
-                context = "（資料が見つかりませんでした。一般的な知識で回答します。）";
-            }
-        } catch (error) {
-            console.error("Error reading file:", error);
-            context = "（資料の読み込みに失敗しました。）";
-        }
-
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
+        // 利用可能なトピック一覧を取得
+        const topics = getAvailableTopics();
+
+        let context = "";
+
+        if (topics.length === 0) {
+            context = "（資料が登録されていません。一般的な知識で回答します。）";
+        } else if (topics.length <= 2) {
+            // ファイルが2つ以下なら全部読み込む（分類不要）
+            context = topics
+                .map((t) => `## ${t.name}\n${readTopicFile(t.filename)}`)
+                .join("\n\n---\n\n");
+        } else {
+            // Step 1: AIにどのファイルが関連するか判定させる
+            const topicList = topics.map((t) => t.name).join("\n- ");
+            const classifyPrompt = `
+以下のカテゴリの中から、ユーザーの質問に回答するために必要なカテゴリを選んでください。
+最大3つまで選べます。カテゴリ名だけをカンマ区切りで回答してください。余計な説明は不要です。
+
+【カテゴリ一覧】
+- ${topicList}
+
+【ユーザーの質問】
+${message}
+
+【回答形式】
+カテゴリ名1,カテゴリ名2
+`;
+
+            const classifyResult = await model.generateContent(classifyPrompt);
+            const classifyResponse = await classifyResult.response;
+            const selectedNames = classifyResponse
+                .text()
+                .split(",")
+                .map((s) => s.trim());
+
+            // 選択されたファイルを読み込む
+            const selectedTopics = topics.filter((t) =>
+                selectedNames.some(
+                    (name) => t.name.includes(name) || name.includes(t.name)
+                )
+            );
+
+            if (selectedTopics.length === 0) {
+                // マッチしなかった場合は全ファイルの先頭部分だけ読む
+                context = topics
+                    .map((t) => {
+                        const content = readTopicFile(t.filename);
+                        return `## ${t.name}\n${content.slice(0, 500)}...`;
+                    })
+                    .join("\n\n---\n\n");
+            } else {
+                context = selectedTopics
+                    .map((t) => `## ${t.name}\n${readTopicFile(t.filename)}`)
+                    .join("\n\n---\n\n");
+            }
+        }
+
+        // Step 2: 選択された資料を使って回答を生成
         const prompt = `
 あなたは「データバンクAI」です。
 以下の「参考資料」の内容に基づいて、教員からの質問に答えてください。
-
 
 【資料の内容】
 ${context}
